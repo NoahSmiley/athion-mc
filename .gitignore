@@ -1,0 +1,53 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock IS committed for binary crates (which is what the launcher is).
+# If we add a library crate later, scope an ignore to it specifically.
+
+# Tauri (when launcher/src-tauri/ exists)
+launcher/src-tauri/target/
+launcher/dist/
+launcher/node_modules/
+
+# Java / Gradle (for the mods and server plugin, when those exist)
+.gradle/
+build/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+.gradletasknamecache
+
+# IDEs
+.idea/
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+*.iml
+*.ipr
+*.iws
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Local-only configuration
+.env
+.env.local
+*.local
+
+# Manifest signing keys — NEVER commit these. Keys live in a password
+# manager / cloud secret store, never on disk in the repo.
+keys/
+*.key
+*.pem
+secrets/
+
+# Logs and crash dumps
+*.log
+crash-reports/
+hs_err_pid*
