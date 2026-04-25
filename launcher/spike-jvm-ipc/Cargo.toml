@@ -1,0 +1,38 @@
+[package]
+name = "liminal-spike-jvm-ipc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike #2 for Liminal Launcher: spawn a JVM child process and exchange WebSocket messages with it."
+
+[[bin]]
+name = "liminal-spike-jvm-ipc"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + child process management + TCP listening.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "time", "io-util"] }
+
+# WebSocket server on top of tokio.
+tokio-tungstenite = "0.24"
+
+# StreamExt / SinkExt for the WebSocket split.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# JSON encoding for the IPC protocol — production launcher will use the
+# same shape (CONTEXT.md: "snake_case keys, type tag in 'type' field,
+# protocol version in 'protocol_version' field on every message").
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random auth token. Without it, any local process could connect to our
+# WebSocket and impersonate the legitimate child.
+rand = "0.8"
+
+# Compact error handling for spike-grade code. The production launcher
+# will use thiserror with typed error enums.
+anyhow = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
