@@ -10,9 +10,13 @@ name = "liminal-spike-mc-transition"
 path = "src/main.rs"
 
 [dependencies]
-# No tokio / tokio-tungstenite / serde / etc. — without our IPC mod inside
-# real Minecraft, there's no JSON message exchange to do. Process spawn,
-# window polling, and process kill are all sync stdlib.
+# Sync WebSocket — fits the existing threaded-sync style (no tokio).
+# tungstenite is what tokio-tungstenite wraps; using it directly keeps
+# the build slim and avoids an async runtime in this spike.
+tungstenite = "0.24"
+serde_json = "1"
+rand = "0.8"
+
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

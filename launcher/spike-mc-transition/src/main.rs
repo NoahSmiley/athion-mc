@@ -39,6 +39,10 @@
 //! 5. Watch: overlay over A → A vanishes → loading screen → B appears in
 //!    A's old rect, fade out.
 
+use std::env;
+use std::fs;
+use std::net::TcpListener as StdTcpListener;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
@@ -47,6 +51,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use rand::distributions::Alphanumeric;
+use rand::Rng;
+use serde_json::Value as Json;
+use tungstenite::Message as WsMessage;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -108,6 +116,9 @@ const WINDOW_CLOSE_TIMEOUT_SECS: u64 = 15;
 /// Tune this if your B instance is consistently slower/faster.
 const POST_WORLD_LOAD_DELAY_SECS: u64 = 20;
 
+/// IPC protocol version. Must match the value in the hub mod's `IpcClient.java`.
+const IPC_PROTOCOL_VERSION: u32 = 1;
+
 
 // ---------------------------------------------------------------------------
 // Overlay command channel (main → win32 thread)
@@ -129,6 +140,30 @@ enum OverlayCmd {
     Hide,
     /// Tear everything down and exit the win32 thread.
     Quit,
+}
+
+// ---------------------------------------------------------------------------
+// IPC events (mod → launcher)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum IpcEvent {
+    /// Hub mod authenticated and reported ready.
+    ModReady { instance_name: String },
+    /// Hub mod requests a transition. `target` is the logical instance
+    /// name to transition to (e.g., "survival"). For this spike we only
+    /// recognize one target and route to INSTANCE_B; production will
+    /// look up `target` in a manifest.
+    TransitionRequest { target: String },
+    /// Hub mod's WebSocket disconnected (process died, etc.).
+    ModDisconnected,
+}
+
+/// What kicked off a transition — used for diagnostics.
+#[derive(Debug, Clone, Copy)]
+enum TriggerSource {
+    Hotkey,
+    IpcRequest,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +207,28 @@ fn main() -> Result<()> {
         })
         .context("spawn overlay thread")?;
 
+    // ---- IPC server: bind ephemeral localhost port, write ipc.json ----
+    //
+    // The hub mod inside Minecraft reads %APPDATA%/Liminal/ipc.json on
+    // startup to discover this URL + auth token. The mod's connection
+    // is asynchronous — it'll arrive sometime during NeoForge's mod
+    // loading phase, well before the user could press the hotkey.
+    let (ipc_event_tx, ipc_event_rx) = mpsc::channel::<IpcEvent>();
+    let ipc_listener = StdTcpListener::bind("127.0.0.1:0")
+        .context("bind localhost IPC listener")?;
+    let ipc_port = ipc_listener.local_addr()?.port();
+    let auth_token = generate_auth_token();
+    let ipc_info_path = write_ipc_json(ipc_port, &auth_token)?;
+    println!("[launcher]   IPC ws://127.0.0.1:{ipc_port}, ipc.json -> {}", ipc_info_path.display());
+    {
+        let token = auth_token.clone();
+        let evt_tx = ipc_event_tx.clone();
+        thread::Builder::new()
+            .name("liminal-ipc".into())
+            .spawn(move || run_ipc_server(ipc_listener, token, evt_tx))
+            .context("spawn IPC thread")?;
+    }
+
     // ---- Stage 1: launch Instance A ----
     println!("\n[launcher] === Stage 1: launch Instance A ({INSTANCE_A}) ===");
     let mut a_prism = launch_via_prism(INSTANCE_A, SERVER_A)?;
@@ -180,11 +237,18 @@ fn main() -> Result<()> {
     let (a_hwnd, a_pid) = wait_for_minecraft_window(MINECRAFT_STARTUP_TIMEOUT_SECS)?;
     println!("[launcher]   Minecraft A window: HWND={:?} PID={a_pid}", a_hwnd.0);
 
-    println!("\n[launcher] Instance A is up. Press Ctrl+Alt+L to transition to {INSTANCE_B}.\n");
+    println!(
+        "\n[launcher] Instance A is up. Trigger transition to {INSTANCE_B} via:\
+         \n  - Ctrl+Alt+L (debug hotkey on the launcher), OR\
+         \n  - F9 inside Minecraft (sends transition_request via IPC mod)\n"
+    );
 
-    // ---- Stage 2: wait for hotkey ----
-    hotkey_rx.recv().context("hotkey channel closed")?;
-    println!("\n[launcher] === Hotkey received — beginning transition ===");
+    // ---- Stage 2: wait for trigger from hotkey OR mod IPC ----
+    let trigger = wait_for_trigger(&hotkey_rx, &ipc_event_rx);
+    match &trigger {
+        TriggerSource::Hotkey => println!("\n[launcher] === Hotkey received — beginning transition ==="),
+        TriggerSource::IpcRequest => println!("\n[launcher] === IPC transition_request received — beginning transition ==="),
+    }
 
     // ---- Stage 3: snap overlay over A ----
     let a_rect = unsafe { get_window_rect(a_hwnd) }.unwrap_or_else(|| primary_monitor_rect());
@@ -335,6 +399,167 @@ fn kill_process_tree(pid: u32) -> Result<()> {
         bail!("taskkill exited non-zero (process may have already gone)");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IPC server (sync, no tokio — one thread per connection)
+// ---------------------------------------------------------------------------
+
+fn generate_auth_token() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+/// Writes `%APPDATA%\Liminal\ipc.json` with our IPC URL + token. The hub
+/// mod inside Minecraft reads this on startup. Returns the path written.
+fn write_ipc_json(port: u16, token: &str) -> Result<PathBuf> {
+    let appdata = env::var("APPDATA").context("APPDATA env var not set")?;
+    let dir = PathBuf::from(appdata).join("Liminal");
+    fs::create_dir_all(&dir).context("create Liminal config dir")?;
+    let path = dir.join("ipc.json");
+    let body = serde_json::json!({
+        "url": format!("ws://127.0.0.1:{port}"),
+        "token": token,
+    });
+    fs::write(&path, body.to_string()).context("write ipc.json")?;
+    Ok(path)
+}
+
+/// Block until either the hotkey fires or the mod sends a transition_request.
+/// Polls both channels with a short sleep — fine for spike grade.
+fn wait_for_trigger(
+    hotkey_rx: &mpsc::Receiver<()>,
+    ipc_event_rx: &mpsc::Receiver<IpcEvent>,
+) -> TriggerSource {
+    loop {
+        if hotkey_rx.try_recv().is_ok() {
+            return TriggerSource::Hotkey;
+        }
+        match ipc_event_rx.try_recv() {
+            Ok(IpcEvent::TransitionRequest { target }) => {
+                println!("[launcher]   IPC transition target requested: {target}");
+                return TriggerSource::IpcRequest;
+            }
+            Ok(IpcEvent::ModReady { instance_name }) => {
+                println!("[launcher]   IPC: mod reported ready (instance_name={instance_name:?})");
+            }
+            Ok(IpcEvent::ModDisconnected) => {
+                println!("[launcher]   IPC: mod disconnected");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // IPC thread is gone — fall back to hotkey-only.
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Accept loop. One thread per connection. The hub mod is the only client
+/// in the production transition lifecycle, so we never expect concurrent
+/// connections, but the per-connection-thread shape is cheap.
+fn run_ipc_server(
+    listener: StdTcpListener,
+    expected_token: String,
+    evt_tx: mpsc::Sender<IpcEvent>,
+) {
+    println!("[ipc] accept loop started on {:?}", listener.local_addr().ok());
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => { eprintln!("[ipc] accept failed: {e}"); continue; }
+        };
+        let token = expected_token.clone();
+        let evt = evt_tx.clone();
+        thread::spawn(move || handle_ipc_connection(stream, token, evt));
+    }
+}
+
+fn handle_ipc_connection(
+    stream: std::net::TcpStream,
+    expected_token: String,
+    evt_tx: mpsc::Sender<IpcEvent>,
+) {
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+    println!("[ipc] connection from {peer}");
+
+    let mut ws = match tungstenite::accept(stream) {
+        Ok(w) => w,
+        Err(e) => { eprintln!("[ipc] handshake failed: {e}"); return; }
+    };
+
+    // Auth handshake.
+    let auth_msg = match ws.read() {
+        Ok(WsMessage::Text(s)) => s.to_string(),
+        Ok(other) => { eprintln!("[ipc] expected text auth, got {other:?}"); return; }
+        Err(e) => { eprintln!("[ipc] read auth failed: {e}"); return; }
+    };
+    let auth: Json = match serde_json::from_str(&auth_msg) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("[ipc] bad auth json: {e}"); return; }
+    };
+    if auth["type"] != "auth" {
+        eprintln!("[ipc] expected type=auth, got {:?}", auth["type"]);
+        return;
+    }
+    let got_token = auth["token"].as_str().unwrap_or("");
+    let got_version = auth["protocol_version"].as_u64().unwrap_or(0) as u32;
+    if got_token != expected_token {
+        let _ = ws.send(WsMessage::Text(r#"{"type":"auth_rejected","reason":"bad token"}"#.into()));
+        eprintln!("[ipc] AUTH REJECTED: bad token");
+        return;
+    }
+    if got_version != IPC_PROTOCOL_VERSION {
+        let reason = format!(
+            "protocol version mismatch (launcher={IPC_PROTOCOL_VERSION}, mod={got_version})"
+        );
+        let _ = ws.send(WsMessage::Text(
+            format!(r#"{{"type":"auth_rejected","reason":"{reason}"}}"#).into()
+        ));
+        eprintln!("[ipc] AUTH REJECTED: {reason}");
+        return;
+    }
+    let _ = ws.send(WsMessage::Text(r#"{"type":"auth_ok"}"#.into()));
+    println!("[ipc] auth ok for {peer}");
+
+    // Read loop.
+    loop {
+        let raw = match ws.read() {
+            Ok(WsMessage::Text(s)) => s.to_string(),
+            Ok(WsMessage::Close(_)) => {
+                println!("[ipc] {peer} closed");
+                let _ = evt_tx.send(IpcEvent::ModDisconnected);
+                return;
+            }
+            Ok(_) => continue, // ignore binary/ping/pong
+            Err(e) => {
+                println!("[ipc] {peer} read error: {e}");
+                let _ = evt_tx.send(IpcEvent::ModDisconnected);
+                return;
+            }
+        };
+        let msg: Json = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("[ipc] bad json from {peer}: {e}"); continue; }
+        };
+        match msg["type"].as_str() {
+            Some("ready") => {
+                let name = msg["instance_name"].as_str().unwrap_or("?").to_string();
+                println!("[ipc] {peer} -> ready (instance_name={name:?})");
+                let _ = evt_tx.send(IpcEvent::ModReady { instance_name: name });
+            }
+            Some("transition_request") => {
+                let target = msg["target"].as_str().unwrap_or("?").to_string();
+                println!("[ipc] {peer} -> transition_request (target={target:?})");
+                let _ = evt_tx.send(IpcEvent::TransitionRequest { target });
+            }
+            Some(other) => println!("[ipc] {peer} -> unhandled type={other}: {raw}"),
+            None => println!("[ipc] {peer} -> message missing type field: {raw}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
