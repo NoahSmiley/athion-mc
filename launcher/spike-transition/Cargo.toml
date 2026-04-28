@@ -1,0 +1,43 @@
+[package]
+name = "liminal-spike-transition"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike #3 for Liminal Launcher: full instance-A-to-instance-B transition combining the overlay (Spike #1) with the JVM/IPC machinery (Spike #2)."
+
+[[bin]]
+name = "liminal-spike-transition"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + child process + TCP listening + sync primitives.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "time", "io-util", "sync"] }
+
+# WebSocket server.
+tokio-tungstenite = "0.24"
+
+# StreamExt / SinkExt for the WebSocket split.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# JSON IPC protocol.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random per-launch auth token.
+rand = "0.8"
+
+# Spike-grade error handling.
+anyhow = "1"
+
+# Win32: overlay window + hotkey + window-by-title lookup + position snapping.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
