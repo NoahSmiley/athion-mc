@@ -1,314 +1,353 @@
-# Liminal Launcher — Project Handoff
+# Athion Client — Project Handoff
 
-> Read this first. It's the single source of truth for project state, architecture decisions, and what to build next.
+> Read this first. Single source of truth for what we're building, why, what's done, and what's next.
 
 ## What this project is
 
-A custom server-branded Minecraft launcher that handles authentication, mod sync, and **seamless transitions between different Minecraft instances** (different versions, different mod loaders) running against different backend servers — without the user perceiving a process restart.
+**Athion's custom Minecraft client.** A closed, end-to-end branded experience for the Athion server network. Players install the Athion app and exist *inside* Athion — never seeing vanilla Minecraft chrome, never connecting to non-Athion servers, never managing instances or modpacks themselves.
 
-Concretely: user is in a NeoForge 1.21.1 hub, types `/survival`, sees a loading screen for ~12-15 seconds, ends up in a Fabric 1.21.11 survival world. The transition feels like an in-game loading screen, not a launcher restart.
+The client wraps Java Minecraft as a rendering engine. Above that we own:
 
-## Why this is interesting
+- A custom **launcher** (Tauri + Rust) that handles login, server selection, instance lifecycle, and the seamless-transition orchestration.
+- **Custom mods** on every Athion instance that strip and replace vanilla menus — no Singleplayer button, no Multiplayer button, no third-party server access. Disconnect routes back to *our* launcher.
+- A WebSocket **IPC bridge** between launcher and the Minecraft client for in-game orchestration (transitions, loading progress, lifecycle).
+- Server-side **Velocity + Spigot plugins** that turn in-game events (commands, portal walks) into IPC trigger messages.
 
-Traditional Minecraft launchers (Prism, MultiMC, vanilla launcher) are general-purpose: they support arbitrary versions, arbitrary mod sets, arbitrary auth providers. This launcher is the opposite — purpose-built for one specific server network, with full control over mods, instances, and the user experience.
+**Headline gameplay feature: seamless transitions.** Player types `/survival` in the hub server, sees a loading screen for ~12 seconds, lands in the survival world — possibly running a different Minecraft version and mod loader (e.g., NeoForge 1.21.1 hub → Fabric 1.21.11 survival). The transition feels like an in-game loading screen, not a launcher restart. Validated end-to-end against real heterogeneous instances; see "Current state" below.
 
-That control unlocks the seamless-transition feature, which no general-purpose launcher can provide. It also dramatically simplifies the scope (no modpack browser, no version picker, no "import CurseForge zip" UI).
+## Why an end-to-end custom client
+
+Traditional Minecraft launchers (vanilla, Prism, MultiMC, CurseForge App) are general-purpose. They support arbitrary versions, arbitrary mod sets, arbitrary auth providers, arbitrary servers. The Athion product is the opposite: **one network, one brand, one curated experience.**
+
+Owning the full stack unlocks things general-purpose launchers can't:
+
+- Seamless cross-loader transitions (the "/survival in hub" UX) — the headline feature, only possible with full control of mod + launcher + window management.
+- Branded UI top to bottom — no "Mojang" splash, no "powered by Java Edition" signaling, no third-party launcher chrome. The user sees Athion, period.
+- Pre-curated, server-managed mod sets — no "import a modpack" friction, no version-mismatch errors, no incompatible-mod debugging by the user.
+- Forced lockdown to Athion-only servers — players can't accidentally hop to other networks from inside the app.
+- Single source of truth for what's installed — manifest-driven from Athion's CDN, no user instance management or mod debugging.
+
+The trade is a closed ecosystem: someone wanting to play vanilla Minecraft, or play on other servers, needs the regular Minecraft launcher (which they can install separately). The Athion app is *for Athion*.
 
 ## Goals and constraints
 
-**Goal:** Ship for real users on a real server.
+**Goal:** Ship a polished end-user product for Athion's player base.
 
-**Platform:** Windows-first. Mac/Linux are out of scope for v1.
+**Platform:** Windows-first. macOS/Linux out of scope for v1.
 
-**Stack:** Tauri 2 + Rust for the launcher. Web frontend for UI. Native Win32 (via `windows-rs`) for window management — Tauri's window abstraction is not sufficient for the overlay/positioning work this project requires.
+**Stack:**
 
-**Scope discipline:** All v1 features are required (full scope, take the time needed). But scope is bounded — features outside the explicit scope below should be rejected.
+- **Launcher:** Tauri 2 + Rust + web frontend (HTML/CSS/JS, framework TBD).
+- **Win32 layer:** `windows-rs` directly for overlay window + window targeting + DPI handling — Tauri's window abstraction isn't sufficient. Validated in Spike #1.
+- **Mods:** NeoForge for hub-style instances (1.21.x), Fabric for performance-oriented instances (1.21.x). Shared Java IPC client library across both loaders. Built with each loader's standard MDK.
+- **Server side:** Velocity proxy plugin for server-driven triggers + backend Spigot/Paper plugins on each Minecraft server for portal-walk events and similar.
+- **Auth:** Microsoft OAuth (mandatory for Minecraft) bridged through Athion's account system.
 
-**Critical constraint:** Only one Minecraft JVM runs at a time. No pre-warmed instances. The transition cold-launches the new instance during the loading screen. This trade is intentional — pre-warming costs ~3 GB RAM and ~500 MB VRAM continuously, which is unacceptable for real users on real hardware.
+**Scope discipline:** All v1 features listed below are required. Anything *not* listed is rejected by default. The point is a polished narrow product, not a flexible one.
+
+**Critical constraints:**
+
+- **One Minecraft JVM at a time.** No pre-warmed instances. (Pre-warming costs ~3GB RAM + ~500MB VRAM continuously — unacceptable for real users.) Transitions cold-launch the new instance during the loading-screen overlay.
+- **Borderless or windowed Minecraft only.** True exclusive fullscreen disables Windows' DWM compositor for the foreground app, which prevents our `WS_EX_LAYERED | WS_EX_TOPMOST` overlay from being composited. Confirmed broken in Spike #1. The launcher will coerce or refuse exclusive fullscreen at transition time. Acceptable trade — most server players prefer borderless anyway for alt-tabbing.
+- **Cold launch must be fast.** Target: median <12s, P95 <18s. Real engineering work — JVM Class Data Sharing, mod-load-order audit, asset pre-warming, shader cache. Not a free lunch.
 
 ## Architecture overview
 
-Five components, monorepo layout:
+### Component layout (monorepo)
 
 ```
-liminal-launcher/
-├── launcher/              # Rust + Tauri desktop app (this is the main work)
-├── mod-shared/            # Common Java code (IPC client, protocol types)
-├── mod-hub/               # NeoForge mod for the hub instance
-├── mod-survival/          # Fabric mod for the survival instance
-├── server-plugin/         # Velocity plugin for transition triggers
-└── infra/
-    ├── manifest-server/   # Hosts instance manifests + mod files
-    └── auth-proxy/        # Optional: server-side auth verification
+liminal-launcher/                        # repo root (codename, see "Naming" below)
+├── launcher/                            # Tauri + Rust desktop app
+│   ├── spike-overlay/                   # Spike #1 — Win32 overlay, validated
+│   ├── spike-jvm-ipc/                   # Spike #2 — JVM child + WebSocket IPC, validated
+│   ├── spike-transition/                # Spike #3 — full transition w/ test JVMs, validated
+│   └── spike-mc-transition/             # Spike #4 — full transition w/ real Minecraft + IPC server, validated
+├── mod-hub/                             # NeoForge mod for hub-style instances
+│   └── (Liminal hub mod — IPC client + F9 debug trigger; menu lockdown TBD)
+├── mod-survival/                        # Fabric mod for survival-style instances — TBD
+├── mod-shared/                          # Shared Java IPC + protocol code — TBD
+├── server-plugin/                       # Velocity plugin for server-driven triggers — TBD
+└── infra/                               # Manifest server, auth proxy, etc. — TBD
 ```
 
-The launcher is the conductor. Each Minecraft instance is a child process with a narrow IPC contract. All orchestration decisions happen in Rust.
+### How a player's session flows (target product UX)
 
-### How a transition works
+1. Player launches the Athion app
+2. Login (Athion account; first run binds the player's Microsoft Minecraft account)
+3. **Server picker** — list of Athion servers (Hub, Survival, Lobby, events, ...) with live status, ping, player count
+4. Click a server → launcher boots Minecraft directly into that server (no main menu, no server-list screen)
+5. In-game: the Athion mod has stripped vanilla menus. Singleplayer button gone. Multiplayer button gone. ESC menu's "Disconnect" returns to *the Athion launcher*, not Mojang's main menu
+6. Server-driven transitions: player types `/survival`, the server sends a `liminal:transition` plugin message to the client, mod forwards via IPC, launcher kills the hub JVM and cold-launches the survival JVM (with `--server` pointed at the survival backend), overlay covers the swap, player lands in survival
 
-1. User in hub types `/survival`
-2. Velocity backend sends `liminal:transition` plugin message to client
-3. Hub mod converts plugin message to IPC `transition_request`
-4. Launcher: read hub window's screen rect via Win32
-5. Launcher: show transparent always-on-top overlay window over hub's rect, drawing dirt-background loading screen with progress bar
-6. Launcher: send `shutdown` to hub via IPC
-7. Hub mod cleanly disconnects, exits process
-8. Launcher waits for hub PID to exit (with timeout)
-9. Launcher launches survival JVM with window initially hidden, positioned at hub's old rect
-10. Survival mod connects to launcher IPC, reports loading progress messages
-11. Launcher updates progress bar as messages arrive
-12. Survival mod signals `first_frame_rendered` after world loads
-13. Launcher: show survival window, transfer focus via `AttachThreadInput` + `SetForegroundWindow`
-14. Launcher: fade overlay alpha 1.0 → 0.0 over 300ms, then hide overlay window
+### How a transition works (validated end-to-end against real Minecraft)
 
-The user's perception: gameplay → loading screen → gameplay. No window flicker, no taskbar churn, no focus loss.
+1. Player types `/survival` (eventual) — *currently:* presses F9 in-game (validated)
+2. Velocity sends `liminal:transition` plugin message — *eventual* — *currently:* mod's F9 handler triggers directly
+3. Mod forwards to launcher as `transition_request` over IPC WebSocket ← validated
+4. Launcher reads hub window's screen rect via Win32 `EnumWindows` + `GetWindowRect` ← validated
+5. Launcher shows transparent always-on-top overlay window over hub's rect, fades in 300ms ← validated
+6. Launcher sends `kill A` (production: clean `shutdown` over IPC; spike: `taskkill /F /T`) ← spike-grade validated
+7. Launcher cold-launches survival JVM with `--server <addr>` so it auto-connects to survival ← validated
+8. Launcher tracks survival window position during loading (re-snaps overlay every 250ms — GLFW reposition is a real thing) ← validated
+9. Once survival's world is rendered, overlay fades out 300ms ← validated, currently driven by fixed 20s post-window-load delay (TBD: replace with `world_loaded` IPC signal)
+10. Player perceives: gameplay → loading screen → gameplay. No taskbar churn, no flicker, no focus loss, no main menu visit ← validated
 
 ### Key architectural decisions and their reasoning
 
-**Single launcher, multiple game children.** Launcher lifetime > all instances. If launcher crashes, instances detect lost IPC connection and exit cleanly. Don't try to make the launcher optional or removable — it's the orchestrator.
+**Single launcher, multiple game children.** Launcher lifetime > all instances. If launcher crashes, instances detect lost IPC and exit cleanly. Launcher is not optional — it's the orchestrator.
 
-**Localhost WebSocket for IPC.** JSON messages, newline-delimited or proper WS frames. Auth token passed via system property to prevent other localhost processes from talking to the launcher. Why WebSocket over plain TCP: bidirectional, framed, broadly supported in both Rust (`tokio-tungstenite`) and Java (`java-websocket` or similar).
+**Localhost WebSocket for IPC.** JSON tagged messages, snake_case, `protocol_version` on auth. Auth via random per-launch token. WebSocket because it's bidirectional, framed, and well-supported in both Rust (`tungstenite`) and Java (`java.net.http.WebSocket`, no extra dependency).
 
-**Auth tokens stored in Windows Credential Manager.** Use the `keyring` crate. Refresh tokens persist across launcher sessions; access tokens are ephemeral. Never write tokens to disk in plain text.
+**Discovery: mod reads `%APPDATA%\Liminal\ipc.json`.** Launcher writes URL + token to this file on startup. Mod reads it on Minecraft startup. Workaround for the fact that we currently use Prism for development and can't inject system properties through it — when we own the launch (Milestone 1+), we'll switch to `-Dliminal.connect.address` / `-Dliminal.auth.token`.
 
-**Content-addressed mod storage.** Mods stored by SHA-256 hash. Instances reference mods by hash. Mod shared between hub and survival is downloaded once. Switching to a new manifest version doesn't redownload unchanged files.
+**Auth tokens stored in Windows Credential Manager.** Use the `keyring` crate. Refresh tokens persist across sessions; access tokens are ephemeral. Never plaintext on disk.
 
-**Manifests are signed.** Signed JSON describes each instance: game version, loader version, mods list (hash + URL + load order), JVM args, asset index. Launcher verifies signature before trusting. This protects users from supply-chain attacks if the CDN is ever compromised.
+**Content-addressed mod storage.** Mods stored by SHA-256 hash. Instances reference mods by hash. Shared mods download once. Manifest version bumps don't redownload unchanged files.
 
-**Honest progress bars require weighted stages.** Each launch stage has a weight (its expected fraction of total time). Within-stage progress is reported where available (per-mod loading, per-asset loading). Weights are learned from rolling averages of recent launches on this user's machine. The bar caps at 99% until `first_frame_rendered` arrives, then snaps to 100% as the overlay fades.
+**Manifests are signed.** Signed JSON describes each instance: game version, loader version, mod list (hash + URL + load order), JVM args, asset index. Launcher verifies signature before trusting. Protects against CDN compromise.
 
-**Native Win32 for the overlay, not Tauri.** Tauri 2 has known issues with transparent windows on Windows (per-pixel alpha gets ignored in some configurations). The overlay window is created directly via `windows-rs` with `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`. Tauri is used for the main launcher UI (login screen, play button) only.
+**Honest progress bars require weighted stages.** Each launch stage has a weight; within-stage progress reported where available (per-mod loading, per-asset loading). Weights learned from rolling averages of the user's recent launches. Bar caps at 99% until `first_frame_rendered` (or for now, a fixed delay), then snaps to 100% as the overlay fades.
 
-**Cold launch performance is critical.** Target: median cold launch under 12 seconds, P95 under 18 seconds. Achievable but requires JVM Class Data Sharing (AppCDS), shader cache persistence, file system page cache pre-warming, and audited mod load order. This is real engineering work, not a free lunch.
+**Native Win32 for the overlay, not Tauri.** Tauri 2 has known issues with transparent windows on Windows. Overlay is created directly via `windows-rs` with `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`. Tauri is for the main launcher UI (login, server picker) only.
+
+**Cold launch performance is critical.** Median <12s, P95 <18s targets. AppCDS (Class Data Sharing), audited mod load order, shader cache persistence, file system page cache pre-warming, asset prefetching. Real engineering, multiple weeks of dedicated work in Milestone 5.
+
+**Menu lockdown via mixin-based UI replacement.** Vanilla Minecraft's `MainScreen`, multiplayer screen, etc. are intercepted via Mixin in the Athion mod and replaced with either no-op (button removed) or Athion-branded equivalents. This is the only way to truly lock the experience — the launcher can't prevent the user from clicking buttons inside Minecraft.
 
 ## v1 feature scope
 
 ### Launcher (Tauri + Rust)
 
-- Microsoft OAuth flow with refresh token persistence (Credential Manager)
+- Branded login screen (Athion account + Microsoft OAuth pairing)
+- Server picker as primary UI — live list of Athion servers with status, ping, player count, news
+- IPC server with random per-launch auth token
 - Manifest fetching from CDN with signature verification
 - Instance file sync: parallel downloads, hash verification, atomic file replacement
-- JVM spawning with full classpath construction (vanilla, NeoForge, Fabric)
-- IPC server with auth tokens
+- JVM spawning with full classpath construction (vanilla, NeoForge, Fabric) — no Prism in production
 - Transition orchestrator (state machine for handoffs)
-- Win32 window manipulation (rect tracking, focus transfer, show/hide)
+- Win32 window manipulation: rect tracking, focus transfer, show/hide, position snapping
 - Transparent always-on-top overlay window
-- Loading screen with weighted progress bar, stage labels, detail text, rotating tips
+- Loading screen with weighted progress, stage labels, detail text, rotating tips
 - Self-update mechanism
 
-### Hub mod (NeoForge 1.21.1)
+### Athion hub mod (NeoForge, currently 1.21.1)
 
-- IPC client connecting to launcher on startup
-- Server plugin message listener (`liminal:transition` channel)
+- IPC client connecting to launcher on Minecraft startup
+- Server plugin message channel listener (`liminal:transition`) — eventual server-driven trigger
 - Window position/size reporter to launcher
+- `world_loaded` signal to replace fixed delay
+- **Menu lockdown:** strip Singleplayer / Multiplayer / Realms buttons, replace main menu, route Disconnect → quit Minecraft → return to Athion launcher
+- Branded splash + loading screens (replace Mojang/Forge defaults where licensable)
 - Clean shutdown handler
 
-### Survival mod (Fabric 1.21.11)
+### Athion survival mod (Fabric, currently 1.21.11)
 
-- IPC client (shared code with hub mod)
-- Window hidden on startup if `liminal.window.hidden=true` system property set
-- Window positioning via system properties (`liminal.window.x`, `.y`, `.width`, `.height`)
+- Same shape as hub mod (most code shared via mod-shared library)
+- Different loader scaffolding
 - Render-loop hook to detect first frame and emit `first_frame_rendered`
-- Per-mod loading progress reporting (hooks into Fabric Loader entrypoints)
-- Connect-on-launch via system property (`liminal.connect.address`)
+- Per-mod loading progress reporting (Fabric Loader entrypoints)
 
 ### Server plugin (Velocity)
 
 - Command handlers: `/survival`, `/hub`, `/lobby`
-- Plugin message channel for transition commands
-- Per-player auth token validation
+- `liminal:transition` plugin message channel for server-driven triggers
+- Per-player auth token validation (so a malicious player can't spoof transition messages)
 
-### Manifest server
+### Backend Spigot/Paper plugins (one per Minecraft backend server)
+
+- Portal-walk event detection → signals Velocity to send transition message
+- Other gameplay-driven trigger sources
+
+### Manifest server / CDN
 
 - Static file server with proper cache headers
 - Signed JSON manifests per instance
 - Mod files served from same CDN
-- Versioned: rolling back is supported
+- Versioned, with rollback support
+
+### Auth proxy (Athion-side)
+
+- Validates Microsoft OAuth tokens
+- Maps Microsoft identity → Athion account
+- Issues short-lived Athion session tokens for client/server auth
 
 ## Milestone breakdown
 
-### Milestone 0: Foundations (1-2 weeks)
+> Spike phase complete. Real Milestone work begins next.
 
-- Tauri project skeleton, Rust workspace
-- Microsoft OAuth flow end-to-end
-- Vanilla Minecraft launch from launcher (no mods, no IPC)
-- Stub manifest server (S3 bucket or static file host)
-- **Done when:** Click Play, log in, vanilla Minecraft launches.
+### Milestone 0: Foundations (~1 week)
 
-### Milestone 1: Mod sync + modded launch
+- Tauri project skeleton
+- Rust workspace structure (replace spike crates with proper modules)
+- Microsoft OAuth flow
+- Vanilla Minecraft launch from raw Rust java cmd (no Prism) — basic case
+- Stub manifest server (S3 or static host)
+- **Done when:** the Athion app shows a login screen, you log in, vanilla Minecraft launches.
+
+### Milestone 1: Production Minecraft launching (~1 week)
+
+- Parse Mojang/Fabric/NeoForge version JSONs
+- Construct full classpath for vanilla, Fabric, NeoForge launches
+- Library + asset download with parallel streams + hashing (content-addressed)
+- File store layout
+- **Done when:** the launcher launches a hub-style NeoForge instance and a survival-style Fabric instance from raw java cmds, lands in their respective servers via `--quickPlayMultiplayer`.
+
+### Milestone 2: Mod sync + menu lockdown (~1 week)
 
 - Manifest schema finalized (versioned, signed)
-- Asset/library/mod download with parallel streams + hashing
-- File store layout (content-addressed)
-- NeoForge launch (modded classpath construction)
-- Fabric launch
-- **Done when:** Launcher can sync and launch both hub and survival instances.
+- Mod files synced based on per-instance manifests
+- Athion mod's menu-lockdown layer (replace vanilla screens via Mixin)
+- **Done when:** when launching any Athion instance, players see only Athion-branded UI inside Minecraft (no Singleplayer button, no Multiplayer button, etc.).
 
-### Milestone 2: IPC layer
-
-- WebSocket server in launcher with auth token validation
-- Java IPC client library (used by both mods)
-- Mod skeletons that connect and send `ready`
-- Loading progress messages flowing through to launcher
-- Graceful disconnect handling
-- **Done when:** Both instances launch, connect to launcher, exchange messages.
-
-### Milestone 3: Transition trigger plumbing
+### Milestone 3: Real production trigger flow (~1 week)
 
 - Velocity plugin sending `liminal:transition` plugin messages
-- Hub mod converting plugin messages to IPC requests
-- Launcher receiving requests, doing naive transition (kill old, launch new — visible flicker is fine at this stage)
-- **Done when:** `/survival` in hub leads to survival instance loading, even if ugly.
+- Athion mod listening on the plugin message channel and forwarding via IPC
+- Backend Spigot plugin for portal-walk triggers
+- **Done when:** `/survival` typed in the hub triggers a real transition end-to-end via the Velocity → mod → launcher path.
 
-### Milestone 4: The transition system itself (the hill)
+### Milestone 4: Polish the transition (~1 week)
 
-- Win32 windowing utilities (rect tracking, focus transfer)
-- Transparent overlay window (native Win32, not Tauri)
-- Loading screen rendering
-- Window show/hide orchestration with proper sequencing
-- Fade timing tuning
-- Crossfade with no visible flicker
-- **Done when:** Cold-launch transition has no visible flicker, no taskbar churn, no focus loss.
+- `world_loaded` IPC signal replaces fixed delay
+- Loading screen with stage labels driven by real progress messages
+- Tips/lore/news system
+- Error recovery (transition fails gracefully)
+- **Done when:** the transition feels native — no fixed delays, real progress, tasteful loading screen.
 
-### Milestone 5: Cold launch optimization
+### Milestone 5: Cold launch optimization (~1-2 weeks)
 
 - JVM Class Data Sharing (AppCDS archive per instance)
 - Mod load order audit
 - Shader cache persistence
-- File system pre-warming during hub session
-- Asset prefetching
-- **Done when:** Median cold launch under 12 seconds.
+- Asset prefetching during hub session
+- File system pre-warming
+- **Done when:** median cold launch <12s, P95 <18s.
 
-### Milestone 6: Loading screen as a feature
+### Milestone 6: Multi-monitor / DPI / display change (~1 week)
 
-- Stage-aware progress display with weighted timing
-- Tips/lore/news system (server-fetched, locally cached)
-- Animations and visual polish (matching Minecraft aesthetic)
-- Error recovery UI (cancellation, retry, fallback to hub)
-- **Done when:** Loading screen feels native to Minecraft, not like a launcher.
-
-### Milestones 7-8: Production hardening
-
-- Multi-monitor handling
-- DPI scaling
+- DPI awareness (`SetProcessDpiAwarenessContext`)
+- Track game window monitor; overlay follows
 - Display change handling (monitor unplugged mid-session)
-- Antivirus compatibility (code-signing the binary)
+
+### Milestone 7: Production hardening (~2-3 weeks)
+
+- Antivirus compatibility (code-signing the binary; ~$200/year cert)
 - Crash reporting (Sentry or similar)
 - Auto-update for launcher binary
 - User-facing error messages for every failure mode
-- Code-signing certificate (~$200/year for production trust)
 - Installer (MSI or NSIS)
-- Manifest CDN with proper caching, signing, version pinning
+- Manifest CDN with proper caching/signing/version pinning
 - Mod tampering detection
 - Documentation + operational runbook
 
-## Current state
+### Milestone 8: Launch + iteration
 
-### Completed
+- Beta with a small set of Athion regulars
+- Telemetry-driven iteration
+- Public launch
 
-- Architecture designed
-- Tech stack chosen (Tauri 2 + Rust + native Win32 for overlay; Java for mods; Velocity for server plugin)
-- Project skeleton bootstrapped (this directory)
-- Spike #1 written and validated: transparent always-on-top overlay with hotkey toggle, 300ms alpha fade, per-Minecraft-window targeting (EnumWindows by title + SetWindowPos), double-buffered paint. Validated against windowed Minecraft on Windows 11: overlay snaps to the game's rect, click-through works, no focus steal, no taskbar entry, no flicker, smooth fade. Exclusive-fullscreen-style mode confirmed broken (overlay does not appear) — launcher will require borderless mode in production. See "Constraints discovered during spike phase" below.
+## Current state (validated)
 
-### In progress
+### Spikes — all four validated end-to-end
 
-- Spike #2 (invisible JVM launch + IPC handshake)
+| # | What | State |
+|---|---|---|
+| 1 | Win32 transparent overlay (`launcher/spike-overlay/`) | ✓ Windowed + borderless work; exclusive fullscreen broken (acceptable, documented) |
+| 2 | JVM child process + WebSocket IPC (`launcher/spike-jvm-ipc/`) | ✓ Java test client connects, authenticates, exchanges messages, exits cleanly |
+| 3 | Full transition mechanic with test JVMs (`launcher/spike-transition/`) | ✓ Hotkey → overlay → swap → reveal, all primitives combined |
+| 4 | Real Minecraft transition via Prism CLI (`launcher/spike-mc-transition/`) | ✓ NeoForge 1.21.1 hub → loading screen → Fabric 1.21.11 survival, auto-joining real multiplayer servers, with the Athion hub mod inside Minecraft triggering transitions via IPC |
 
-### Not started
+### Athion hub mod (`mod-hub/`)
 
-- Spike #3 (full transition: kill instance A, launch hidden instance B, swap windows)
-- Everything from Milestone 0 onward
+- NeoForge MDK customized as `mod_id=liminal_hub`, client-only
+- IPC client reading `%APPDATA%\Liminal\ipc.json` for launcher discovery; runs Spike #2's auth/ready handshake
+- F9 hotkey inside Minecraft sends `transition_request` to launcher → launcher fires the existing transition flow
+- Validated against the launcher: full mod ↔ launcher trigger path works end-to-end
 
-### Constraints discovered during spike phase
+### Local test infrastructure (outside the repo)
 
-- **Players must run Minecraft in windowed or borderless fullscreen.** True exclusive fullscreen disables Windows' DWM compositor for the foreground app, which prevents our `WS_EX_LAYERED | WS_EX_TOPMOST` overlay from being composited over the game. Confirmed via Spike #1 on Windows 11. The launcher will detect exclusive fullscreen at transition time and either (a) refuse to transition with a user-facing explanation, or (b) coerce the game to borderless before transitioning. Most server-oriented players already prefer borderless for alt-tabbing, so this isn't a meaningful UX cost. Borderless fullscreen behavior not yet directly tested in Spike #1 — will verify in Spike #3 when we test against an actively-loading instance.
+- NeoForge 1.21.1 server at `localhost:25565` for hub testing
+- Vanilla 1.21.11 server at `localhost:25566` for survival testing
+- Microsoft OpenJDK 21 installed for Java work
+- Prism Launcher used as a development-time stand-in for production launching (will be replaced in Milestone 1)
+
+### What's been intentionally deferred
+
+- Production Minecraft launching — currently rides on Prism CLI; replaced in Milestone 1
+- Auth — currently uses Prism's stored Microsoft account; replaced in Milestone 0
+- Manifest sync — no manifest server yet; Milestone 1
+- Menu lockdown — none yet; Milestone 2
+- `world_loaded` IPC signal — currently a fixed 20s post-window-load delay; Milestone 4
+- Survival mod (Fabric edition) — only hub mod exists; Milestone 2 or 3 depending on order
+- Velocity plugin — currently F9 hotkey is the trigger; Milestone 3
+- Tauri UI — none yet, launcher is currently a CLI-style spike; Milestone 0
 
 ## What to build next
 
-**Immediate next step:** Run the overlay spike at `launcher/spike-overlay/`. Follow the README's test matrix. Document which scenarios pass and which fail. The pattern of failures determines which production fixes are needed (for instance, "exclusive fullscreen fails but borderless works" → the launcher requires borderless mode).
+The spike phase is *done*. Time for real Milestone work.
 
-**After the overlay spike validates (or we adapt around its failures):**
+**Highest impact direction:** Milestone 0 (Tauri skeleton + Microsoft OAuth + vanilla Minecraft launch from raw java cmd). This unlocks everything downstream because every other milestone needs the launcher to be more than a spike binary.
 
-Build Spike #2: invisible JVM launch + IPC.
+**Alternate near-term high-impact bets:**
 
-- Rust program that spawns `java -jar <test-jar>` as a child process
-- Rust program runs WebSocket server on localhost
-- Pass IPC port + auth token via system properties
-- Java side: tiny program that connects to WebSocket, handshakes, sends test messages, listens for shutdown command, exits cleanly
-- Validates: child process management, IPC handshake, clean shutdown, no orphan processes
-- This spike is cross-platform — can be developed on Mac if needed, then validated on Windows
+- **Milestone 3 first** (Velocity plugin + mod plugin message channel) — finishes the architecture diagram against the existing spike infrastructure. Lets us demo "type `/survival` in real game, get to survival" end-to-end without any new launcher work. Defers Tauri UI but completes the *headline UX*.
+- **Menu lockdown spike** in `mod-hub/` — visually striking, technically self-contained, validates the lockdown approach (Mixins to replace screens) before we depend on it for the launcher's "no main menu" guarantee.
 
-**After Spike #2:**
+My honest recommendation: **Milestone 0 first.** Without a real launcher, every other piece is bottlenecked. Tauri scaffolding + login screen + "click → launch vanilla Minecraft" is concrete, demoable, and the foundation everything else builds on. Track 3 work (Velocity plugin, menu lockdown) is meaningfully easier when there's a real launcher to integrate with.
 
-Build Spike #3: full transition mechanics.
+## Open questions / TBDs
 
-- Combine spikes #1 and #2
-- Two pre-built Minecraft instances (vanilla 1.21.1 Fabric for both, simplest possible)
-- Single test mod that works in both
-- Hotkey trigger to start transition
-- Full sequence: overlay shown, instance A killed, instance B launched hidden, instance B revealed, focus transferred, overlay faded
-- Validates: the entire seamless transition mechanic end-to-end
-- Same Minecraft version on both sides for the spike — cross-version comes later because version differences don't change the windowing problem
-
-**Only after all three spikes validate:** start Milestone 0 (proper foundations).
-
-## Open questions to resolve before milestone 1
-
-These need answers before code that depends on them can be written:
-
-1. **Server hostnames.** What addresses will hub and survival actually live at? Direct DNS (`hub.liminal.gg`, `survival.liminal.gg`)? Behind Cloudflare? Velocity proxy on a single port routing internally?
-
-2. **Microsoft Azure tenant.** Need to register an Azure application to get an OAuth client ID. Free, ~20 min, requires Microsoft account. Has this been done?
-
-3. **CDN for mod hosting.** Cloudflare R2? AWS S3? Self-hosted on the homelab? Affects manifest URL structure, signing strategy, cache behavior.
-
-4. **Manifest signing strategy.** Ed25519 keypair? RSA? Where does the private key live? How are public keys embedded in the launcher binary (and rotated if needed)?
-
-5. **Backend for tips/news in loading screen.** Static file refreshed periodically? Dynamic API? Local-only with launcher updates pushing new tips?
-
-6. **Telemetry strategy.** Crash reporting yes (Sentry default). Usage telemetry — opt-in or none? GDPR considerations if EU users will be served.
+1. **Naming.** Public brand is **Athion**. Internal codename and code prefix is **Liminal** (mod IDs, system properties, IPC file paths). Working assumption: keep the codename internally (no rename pain), present as Athion externally. If we want a unified name, decide before Milestone 7 (installer naming).
+2. **Server hostnames.** What addresses will Athion's hub/survival/etc. live at in production? Direct DNS, behind Cloudflare, single Velocity port routing internally?
+3. **Microsoft Azure tenant.** Need an Azure app registration for OAuth (free, ~20 min). Has this been done?
+4. **CDN for mod hosting.** Cloudflare R2? AWS S3? Self-hosted on Athion's Proxmox? Affects manifest URLs, signing strategy, cache behavior.
+5. **Manifest signing.** Ed25519? Where does the private key live? How are public keys baked into / rotated from the launcher binary?
+6. **Tips/news backend in loading screen.** Static file refreshed periodically? Dynamic API? Ship-with-launcher-and-update?
+7. **Telemetry strategy.** Crash reporting yes (Sentry default). Usage telemetry — opt-in or none? GDPR if EU users will be served.
+8. **Athion account ↔ Microsoft account binding.** First-run flow design — single sign-in via Athion that proxies Microsoft? Two separate sign-ins? Account recovery story?
 
 ## Decisions explicitly deferred
 
-These are *not* in scope for the foreseeable future:
+These are *not* in scope for v1 unless explicitly added:
 
 - macOS support
 - Linux support
-- Multi-server federation (one launcher serving multiple unrelated server networks)
-- In-launcher chat / social features
+- Multi-server federation (one launcher serving multiple unrelated networks)
+- In-launcher chat / social features (could come later as Athion features, not v1)
 - Modpack browser / mod marketplace
 - Custom Minecraft proxy / network code
 - Voice chat integration
 - Streaming / OBS integration
+- Player-managed instances or mod customization
 
-If a feature request lands here, default answer is no unless it advances the v1 goal.
+Any feature request that lands here defaults to "no" unless it advances the v1 product.
 
-## Key files
+## Naming and codebase conventions
 
-- `launcher/spike-overlay/Cargo.toml` — dependencies for overlay spike
-- `launcher/spike-overlay/src/main.rs` — overlay spike implementation, heavily commented
-- `launcher/spike-overlay/README.md` — test matrix and how to run
+**Brand vs codename:**
 
-## Coding conventions
+- **Athion** is the player-facing brand. App name, installer name, server-list UI text, marketing.
+- **Liminal** is the internal codename. Mod IDs (`liminal_hub`, `liminal_survival`, `liminal_shared`), system properties (`liminal.connect.address`, `liminal.auth.token`), IPC file path (`%APPDATA%\Liminal\ipc.json`), namespace prefixes in the Rust workspace.
 
-- **Rust:** standard rustfmt, clippy clean. Comments explain *why*, not *what*. Module-level docs explain the role of each module.
-- **Java:** standard conventions for the Minecraft mod ecosystem. Mixins prefixed `Mixin*`. Mod IDs `liminal_hub`, `liminal_survival`, `liminal_shared`.
-- **JSON IPC messages:** snake_case keys, type tag in `"type"` field, protocol version in `"protocol_version"` field on every message.
-- **Logging:** structured logs (JSON or key=value), separate launcher and game-side logs, correlation IDs for transitions so you can trace a transition end-to-end across processes.
+The dual name is intentional: internal stability (no global rename) + clean external brand. Don't rename `liminal_*` identifiers unless we have a strong reason; do present everything user-facing as Athion.
+
+**Note on the `liminal-launcher/` directory name:** the repo lives at `~/Desktop/liminal-launcher/` because there's an unrelated project at `~/Desktop/liminal/` (a Tauri-based AI terminal IDE — completely different thing that happens to share the name). The `-launcher` suffix disambiguates them. The GitHub repo is `athion-mc`; the local dir name is historical and fine to leave as-is.
+
+**Code conventions:**
+
+- **Rust:** standard rustfmt, clippy clean. Comments explain *why*, not *what*. Module-level docs explain each module's role.
+- **Java:** standard Minecraft modding conventions. Mixins prefixed `Mixin*`. Mod IDs `liminal_hub`, `liminal_survival`, `liminal_shared`.
+- **JSON IPC messages:** snake_case keys, `type` tag on every message, `protocol_version` on the auth message.
+- **Logging:** structured, separate launcher and game-side logs, correlation IDs for transitions so a single transition can be traced end-to-end across processes.
 
 ## How to use this document with Claude Code
 
-When starting a Claude Code session in this project's directory, prompt it with something like:
+When starting a Claude Code session in this project's directory:
 
-> Read CONTEXT.md to understand this project's state, architecture, and constraints. Then [specific task].
+> Read CONTEXT.md to understand the project's vision, current state, and what to build next. Then [specific task].
 
-The doc captures the *why* of decisions, which lets Claude Code make consistent choices on related questions without needing to re-derive them. Update this doc whenever an architectural decision changes — it's the project's memory.
+The doc captures the *why* behind decisions, not just the *what*, so Claude can make consistent choices on related questions without re-deriving them. Update this doc whenever an architectural decision changes or a milestone moves — it's the project's memory.
 
 ## Outstanding clarifications
 
-This doc reflects decisions made in the planning conversation that produced it. Anything not explicitly decided here is open. When in doubt, the decisions in this document take precedence over assumptions or general best practices, because the decisions here account for project-specific constraints that general advice doesn't know about.
-
-## Note on the name
-
-The name "Liminal Launcher" coexists with an unrelated project at `~/Desktop/liminal/` — a Tauri-based AI terminal IDE that happens to share the "liminal" name. They have nothing to do with each other. To avoid confusion, this project's directory is `liminal-launcher/`, not `liminal/`.
+This doc reflects decisions made through the spike phase. Anything not explicitly here is open. When in doubt, the decisions in this document take precedence over assumptions or general best practices, because they account for project-specific constraints that general advice doesn't know about.
